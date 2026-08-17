@@ -12,6 +12,15 @@ from readability import Document
 import trafilatura
 import re
 import cloudscraper
+import asyncio
+import aiohttp
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+load_dotenv()
+from langchain_core.output_parsers import StrOutputParser
+
+
 
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -21,6 +30,12 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
+llm = ChatOpenAI(
+    model="nvidia/nemotron-3-super-120b-a12b:free",
+    api_key=os.getenv("OPENROUTER_API_KEY"),  
+    base_url="https://openrouter.ai/api/v1",
+    temperature=0
+)
 
 # ==========================================
 # TOOL 1
@@ -91,13 +106,35 @@ def extract_free_pdf_url(paper_data: dict) -> str | None:
 # TOOL 2
 # ==========================================
 
+# Query Generator (Pydantic Schema)
+class SearchQueries(BaseModel):
+    queries: list[str] = Field(
+        description="A list of exactly 3 highly specific academic search queries."
+    )
+
+def generate_optimized_queries(user_topic: str, llm) -> list[str]:
+    """Translates a broad topic into 3 optimized academic search queries."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert academic research librarian. 
+        Generate exactly 3 specific, distinct search queries that would yield the best academic papers on Semantic Scholar based on the user's topic. 
+        Make them sound like paper titles or specific methodologies. Just return the 3 queries."""),
+        ("user", "{topic}")
+    ])
+    
+    structured_llm = llm.with_structured_output(SearchQueries)
+    query_chain = prompt | structured_llm
+    return query_chain.invoke({"topic": user_topic}).queries
+
+
 BASE_URL = "https://api.semanticscholar.org/graph/v1"
 api_key = os.getenv("SEMTANTIC_SCHOLAR_API_KEY")
 HEADERS = {"x-api-key": api_key} if api_key else {}
 # Tool 2
-@tool
-def search_academic_papers(
-        query: str, limit: int = 5, year_range: str =None
+
+
+
+async def search_academic_papers_async(
+    query: str, session: aiohttp.ClientSession, limit: int = 5, year_range: str = None
 ) -> str:
     """Searches for academic papers on Semantic Scholar and extracts ArXiv PDF links.
 
@@ -118,35 +155,32 @@ def search_academic_papers(
 
     max_retries = 3
     for attempt in range(max_retries):
-        response = requests.get(
-            f"{BASE_URL}/paper/search", 
-            params=params, 
-            headers=HEADERS, 
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            break  
-            
-        elif response.status_code == 429:
-            if attempt < max_retries - 1:
-                # Wait 2 seconds, then 4 seconds before trying again
-                time.sleep(2 ** (attempt + 1)) 
-                continue
+        # Using aiohttp async network request instead of requests.get
+        async with session.get(f"{BASE_URL}/paper/search", params=params, headers=HEADERS) as response:
+            if response.status == 200:
+                data = await response.json()
+                break  
+            elif response.status == 429:
+                if attempt < max_retries - 1:
+                    # MUST use asyncio.sleep, not time.sleep!
+                    await asyncio.sleep(2 ** (attempt + 1)) 
+                    continue
+                else:
+                    return f"Error: 429 - Semantic Scholar rate limit exceeded."
             else:
-                return "Error: 429 - Semantic Scholar rate limit exceeded despite retries. Try narrowing the search."
-        else:
-            return f"Error: {response.status_code} - {response.text}"
+                error_text = await response.text()
+                return f"Error: {response.status} - {error_text}"
+    else:
+        # Fallback if loop finishes without breaking
+        data = {}
 
-    data = response.json().get("data", [])
-
-
-    if not data:
-        return "No papers found for the given query."
+    papers = data.get("data", [])
+    if not papers:
+        return f"No papers found for the query: '{query}'"
 
     results = []
-    for p in data:
-        authors = ", ".join([a["name"] for a in p.get("authors", [])])
+    for p in papers: 
+        authors = ", ".join([a["name"] for a in p.get("authors", []) if "name" in a])
         tldr = (
             p.get("tldr", {}).get("text")
             if p.get("tldr")
@@ -154,6 +188,9 @@ def search_academic_papers(
         )
 
         pdf_url = extract_free_pdf_url(p)
+
+        if not pdf_url:
+            pdf_url = "No free PDF available (Not open access)."
 
         paper_url = p.get("url", "N/A")
 
@@ -167,6 +204,56 @@ def search_academic_papers(
         )
 
     return "\n---\n".join(results)
+
+
+
+
+
+# Async Gather function
+async def fetch_all_academic_papers_async(queries: list[str]) -> str:
+    """Creates an async session and fetches all 3 queries at the exact same time."""
+    combined_results = []
+    
+    # Open a single aiohttp session to reuse connections (much faster)
+    async with aiohttp.ClientSession() as session:
+        # Create a list of async tasks
+        tasks = [
+            search_academic_papers_async(query, session, limit=5) 
+            for query in queries
+        ]
+        
+        # Run them all concurrently using gather!
+        # return_exceptions=True prevents one failed query from crashing the others
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Format the combined results
+        for query, result in zip(queries, results):
+            if isinstance(result, Exception):
+                combined_results.append(f"### Results for: '{query}' ###\nError: {str(result)}")
+            else:
+                combined_results.append(f"### Results for: '{query}' ###\n{result}")
+                
+    return "\n\n".join(combined_results)
+
+
+@tool
+def deep_academic_research(topic: str) -> str:
+    """
+    Searches for academic papers on Semantic Scholar.
+    Use this tool whenever you need deep, academic literature on a topic.
+    You just provide the broad topic, and this tool automatically expands it 
+    into 3 specialized queries and fetches 15 papers asynchronously.
+    """
+    try:
+        # 1. Expand the broad topic into 3 specific queries
+        optimized_queries = generate_optimized_queries(topic, llm)
+        
+        # 2. Fetch all 15 results concurrently
+        results = asyncio.run(fetch_all_academic_papers_async(optimized_queries))
+        
+        return f"Searched 3 specialized sub-topics: {optimized_queries}\n\n{results}"
+    except Exception as e:
+        return f"Deep research failed: {str(e)}"
 
 
 
@@ -260,7 +347,7 @@ def scrape_url(url: str) -> str:
         cleaned = re.sub(r'\s+', ' ', text)
 
         if cleaned:
-            return cleaned[:5000]
+            return cleaned[:15000]
 
         return "Could not extract meaningful content from the page."
 
@@ -314,7 +401,7 @@ def read_pdf_from_url(pdf_url: str) -> str:
         
         # Optional: Truncate if you are hitting token limits on your LLM's context window
         # (e.g., returning only the first 50,000 characters)
-        return full_text[:50000] 
+        return full_text[:30000] 
         
         # return full_text
         
