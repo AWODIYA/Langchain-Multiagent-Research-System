@@ -211,7 +211,7 @@ def main():
 
     # Top Header
     st.markdown('<div class="main-title">RESEARCHER AGENT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="description">An autonomous multi-agent system powered by LangChain and LangGraph. It leverages specialized agents to search academic databases (Semantic Scholar/arXiv) and the web, scrape complex PDFs, synthesize comprehensive reports, and critically review the findings.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="description">An autonomous multi-agent system powered by LangChain. It leverages specialized agents to search academic databases (Semantic Scholar/arXiv) and the web, scrape complex PDFs, synthesize comprehensive reports, and critically review the findings.</div>', unsafe_allow_html=True)
 
     # Two-Column Layout (Matching image_21cfe1.png)
     col_left, col_right = st.columns([1, 1.2], gap="large")
